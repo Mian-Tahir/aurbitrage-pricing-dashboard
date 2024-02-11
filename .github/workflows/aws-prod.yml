@@ -1,0 +1,159 @@
+name: Deploy to Amazon EC2
+
+on:
+  push:
+    branches: ["prod"]
+
+env:
+  AWS_REGION: eu-north-1
+  ECR_REPOSITORY: aurbitrage-pricing 
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}      
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    environment: production 
+
+    steps:
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_CHANNEL: aurbitrage-notifications 
+        SLACK_COLOR: ${{ job.status }} # or a specific color like 'good' or '#ff00ff'
+        SLACK_MESSAGE: ':rocket: A build is in progress'
+        SLACK_TITLE: Aurbitrage Dashboard Building for Production
+        SLACK_WEBHOOK: ${{vars.SLACK_WEBHOOK}}
+
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+        GBQ_CRED: ${{secrets.GBQ_CREDS}}
+      run: |
+        # Build a docker container and
+        # push it to ECR so that it can
+        # be deployed to ECS.
+        echo $GBQ_CRED > backend/pricing-aurbitrage.json
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_CHANNEL: aurbitrage-notifications 
+        SLACK_COLOR: ${{ job.status }}
+        SLACK_MESSAGE: ':white_check_mark: build complete, check for errors'
+        SLACK_TITLE: Aurbitrage Dashboard Build for Production
+        SLACK_WEBHOOK: ${{vars.SLACK_WEBHOOK}}
+
+    - name: Slack Notification
+      uses: ravsamhq/notify-slack-action@v2
+      if: always()
+      with:
+        status: ${{ job.status }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        notification_title: "Aurbitrage Dashboard Build for PRODUCTION has {status_message}"
+        message_format: ":red_circle: *{workflow}* {status_message} in <{repo_url}|{repo}>"
+        footer: "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Workflow>"
+        notify_when: "failure"
+      env:
+        SLACK_WEBHOOK_URL: ${{vars.SLACK_WEBHOOK}}
+
+
+  deploy:
+
+    name: Deploy
+    runs-on: ubuntu-latest
+    environment: production
+    needs: build
+
+    steps:
+
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_CHANNEL: aurbitrage-notifications 
+        SLACK_COLOR: ${{ job.status }} # or a specific color like 'good' or '#ff00ff'
+        SLACK_MESSAGE: ':rocket: A deployment is in progress'
+        SLACK_TITLE: Aurbitrage Dashboard Deploying to Production
+        SLACK_WEBHOOK: ${{vars.SLACK_WEBHOOK}}
+
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+
+    - name: Copy files to EC2 instance
+      uses: appleboy/scp-action@v0.1.4
+      with:
+        host: ${{ secrets.EC2_HOST}}
+        username: ${{ secrets.EC2_USERNAME}}
+        key: ${{ secrets.EC2_SSH_KEY}}
+        source: "./docker-compose.yml,nginx.conf"
+        target: "~"
+
+    - name: executing remote ssh commands
+      env: 
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        EC2_KEY: ${{ secrets.EC2_SSH_KEY }}
+      run: |
+        export AWS_PASSWORD=$(aws ecr get-login-password --region ${{ env.AWS_REGION}})
+        echo -e "$EC2_KEY">aws_key.pem
+        chmod 600 aws_key.pem 
+        ssh -o StrictHostKeyChecking=no -i aws_key.pem ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} "\
+          echo '$AWS_PASSWORD' | docker login --username AWS --password-stdin $ECR_REGISTRY; \
+          docker-compose pull; \
+          docker-compose up --force-recreate -d"
+
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_CHANNEL: aurbitrage-notifications 
+        SLACK_COLOR: ${{ job.status }}
+        SLACK_MESSAGE: ':white_check_mark: deployment complete, check for errors'
+        SLACK_TITLE: Aurbitrage Dashboard Deployed to Production
+        SLACK_WEBHOOK: ${{vars.SLACK_WEBHOOK}}
+
+    - name: Slack Notification
+      uses: ravsamhq/notify-slack-action@v2
+      if: always()
+      with:
+        status: ${{ job.status }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        notification_title: "Aurbitrage Dashboard Deployment to PRODUCTION has {status_message}"
+        message_format: ":red_circle: *{workflow}* {status_message} in <{repo_url}|{repo}>"
+        footer: "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Workflow>"
+        notify_when: "failure"
+      env:
+        SLACK_WEBHOOK_URL: ${{vars.SLACK_WEBHOOK}}
+
